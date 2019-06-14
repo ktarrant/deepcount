@@ -1,24 +1,56 @@
 import logging
 import datetime
+import os
 
-import pandas as pd
 from transitions import Machine
 
 from ibapi.common import BarData
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
-from ibapi.ticktype import TickType, TickTypeEnum
 
 logger = logging.getLogger(__name__)
 
 
-class SnapshotDriver():
-    REQ_HISTORICAL = 1
+class SnapshotWriter:
 
     BAR_COLUMNS = [
-        "date", "open", "high", "low", "close", "volume", "barCount", "average",
+        "date", "open", "high", "low", "close", "volume",
+        # "barCount", "average",
     ]
+
+    def __init__(self, ticker : str, base_dir = "snapshots"):
+        self.ticker = ticker
+        self.base_dir = base_dir
+        self.cur_date = None
+        self.cur_file = None
+
+    def save_bar(self, req_id : int, bar : BarData):
+        dt = datetime.datetime.strptime(bar.date, "%Y%m%d %H:%M:%S")
+        d = dt.date()
+
+        if self.cur_date != d:
+            if self.cur_file:
+                self.cur_file.close()
+            self.cur_date = d
+            filename = "{date}_{ticker}.csv".format(date=d, ticker=self.ticker)
+            filepath = os.path.join(self.base_dir, filename)
+            os.makedirs(self.base_dir, exist_ok=True)
+            self.cur_file = open(filepath, "w")
+            self.cur_file.write(",".join(self.BAR_COLUMNS) + "\n")
+
+        fields = [str(getattr(bar, f)) for f in self.BAR_COLUMNS]
+        self.cur_file.write(",".join(fields) + "\n")
+
+    def finalize(self):
+        self.cur_date = None
+        if self.cur_file:
+            self.cur_file.close()
+            self.cur_file = None
+
+
+class SnapshotDriver():
+    REQ_HISTORICAL = 1
 
     @staticmethod
     def third_friday(year, month):
@@ -75,15 +107,17 @@ class SnapshotDriver():
         machine.add_transition("historicalDataEnd",
                                "req_historical",
                                "finalize",
-                               after="disconnect")
+                               after=["cleanup", "disconnect"])
 
     def __init__(self, app : EClient, **kwargs):
         self.app = app
         self.base_symbol = kwargs.get("base_symbol")
         self.exchange = kwargs.get("exchange")
-        self.results = pd.DataFrame(columns=self.BAR_COLUMNS)
         self.endtime_index = datetime.datetime.today()
         self.row_index = 0
+        self.local_symbol = self.compute_ticker(self.base_symbol,
+                                                self.endtime_index)
+        self.writer = SnapshotWriter(self.local_symbol)
 
         # configuration options
         self.machine = SnapshotDriver.create_machine(self)
@@ -102,30 +136,26 @@ class SnapshotDriver():
         if error_code >= 2000 and error_code < 10000:
             return False
         elif error_code == 10167: # delayed market data instead
-            if self.market_data_type == self.MARKET_DATA_REALTIME:
-                return True
-            else:
-                return False
+            return False
         else:
             return True
 
-    def send_req_historical(self, event):
-        local_symbol = self.compute_ticker(self.base_symbol, self.endtime_index)
-        contract = self.futures_contract(local_symbol, self.exchange)
+    def send_req_historical(self, *_, **__):
+        contract = self.futures_contract(self.local_symbol, self.exchange)
         query_time = self.endtime_index.strftime("%Y%m%d %H:%M:%S")
         self.app.reqHistoricalData(self.REQ_HISTORICAL,
                                    contract, query_time,
-                                   "1 D", "1 min", "TRADES",
+                                   "3 M", "5 mins", "TRADES",
                                    1, # useRTH - set to 0 to get after hours
                                    1,
                                    False, # keep up to date
                                    [])
 
-    def save_bar_data(self, reqId:int, bar: BarData):
-        self.results.loc[self.row_index] = [
-            getattr(bar, column) for column in self.results.columns]
-        self.row_index += 1
+    def save_bar_data(self, req_id: int, bar: BarData):
+        self.writer.save_bar(req_id, bar)
 
+    def cleanup(self, *args):
+        self.writer.finalize()
 
 class SnapshotWrapper(EWrapper):
 
@@ -151,9 +181,6 @@ class SnapshotApp(EClient):
 
     def keyboardInterrupt(self):
         self.driver.stop()
-
-    def get_result(self):
-        return self.driver.results
 
 def configure_parser(parser):
     parser.add_argument("--host", default="127.0.0.1")
@@ -183,7 +210,3 @@ if __name__ == "__main__":
     app = SnapshotApp(args.symbol, args.exchange)
     app.connect(args.host, args.port, args.clientid)
     app.run()
-
-    result = app.get_result()
-    print(result)
-    result.to_csv("{}.csv".format(args.symbol))
