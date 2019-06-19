@@ -1,6 +1,7 @@
 import logging
 import datetime
 import os
+from collections import OrderedDict
 
 from transitions import Machine
 
@@ -25,7 +26,7 @@ class SnapshotWriter:
         self.cur_date = None
         self.cur_file = None
 
-    def save_bar(self, req_id : int, bar : BarData):
+    def save_bar(self, bar : BarData):
         dt = datetime.datetime.strptime(bar.date, "%Y%m%d %H:%M:%S")
         d = dt.date()
 
@@ -52,37 +53,14 @@ class SnapshotWriter:
 class SnapshotDriver():
     REQ_HISTORICAL = 1
 
-    @staticmethod
-    def third_friday(year, month):
-        fridays = [d for d in range(1, 22) if
-                   datetime.datetime(year=year, month=month,
-                                     day=d).weekday() == 4]
-        return datetime.datetime(year=year, month=month, day=fridays[2])
-
-    @staticmethod
-    def compute_ticker(base="ES", end_date=datetime.datetime.today()):
-        """ third Friday in the third month of each quarter """
-        expiration_labels = ["H", "M", "U", "Z", "H"]
-        expiration_months = [3, 6, 9, 12, 3]
-        expiration_years = [end_date.year] * 4 + [end_date.year + 1]
-        expiration_dates = [SnapshotDriver.third_friday(y, m)
-                            for y, m in zip(expiration_years,
-                                            expiration_months)]
-        expiration_label = expiration_labels[
-            next(i for i in range(5) if expiration_dates[i] > end_date)]
-        year_suffix = str(end_date.year)[-1:]
-        return f"{base}{expiration_label}{year_suffix}"
-
-    @staticmethod
-    def futures_contract(ticker: str, exchange: str):
-        # ! [futcontract_local_symbol]
-        contract = Contract()
-        contract.secType = "FUT"
-        contract.exchange = exchange
-        contract.currency = "USD"
-        contract.localSymbol = ticker
-        # ! [futcontract_local_symbol]
-        return contract
+    class Request:
+        def __init__(self, contract: Contract, endtime: datetime.datetime,
+                     duration="3 M", barsize="5 mins", after_hours=False):
+            self.contract = contract
+            self.endtime = endtime
+            self.duration = duration
+            self.barsize = barsize
+            self.after_hours = after_hours
 
     @staticmethod
     def create_machine(model):
@@ -106,18 +84,20 @@ class SnapshotDriver():
                                after="save_bar_data")
         machine.add_transition("historicalDataEnd",
                                "req_historical",
+                               "=",
+                               conditions=["is_request_pending"],
+                               after="send_req_historical")
+        machine.add_transition("historicalDataEnd",
+                               "req_historical",
                                "finalize",
+                               unless=["is_request_pending"],
                                after=["cleanup", "disconnect"])
 
-    def __init__(self, app : EClient, **kwargs):
+    def __init__(self, app: EClient, requests : list):
         self.app = app
-        self.base_symbol = kwargs.get("base_symbol")
-        self.exchange = kwargs.get("exchange")
-        self.endtime_index = datetime.datetime.today()
+        self.requests = requests
         self.row_index = 0
-        self.local_symbol = self.compute_ticker(self.base_symbol,
-                                                self.endtime_index)
-        self.writer = SnapshotWriter(self.local_symbol)
+        self.current_writer = None
 
         # configuration options
         self.machine = SnapshotDriver.create_machine(self)
@@ -140,22 +120,34 @@ class SnapshotDriver():
         else:
             return True
 
+    def is_request_pending(self, *_):
+        return len(self.requests) > 0
+
     def send_req_historical(self, *_, **__):
-        contract = self.futures_contract(self.local_symbol, self.exchange)
-        query_time = self.endtime_index.strftime("%Y%m%d %H:%M:%S")
+        request = self.requests.pop()
+        local_symbol = request.contract.localSymbol
+        if self.current_writer:
+            self.current_writer.finalize()
+        self.current_writer = SnapshotWriter(local_symbol)
+
+        query_time = request.endtime.strftime("%Y%m%d %H:%M:%S")
         self.app.reqHistoricalData(self.REQ_HISTORICAL,
-                                   contract, query_time,
-                                   "3 M", "5 mins", "TRADES",
-                                   1, # useRTH - set to 0 to get after hours
+                                   request.contract,
+                                   query_time,
+                                   request.duration,
+                                   request.barsize,
+                                   "TRADES",
+                                   0 if request.after_hours else 1,
                                    1,
                                    False, # keep up to date
                                    [])
 
     def save_bar_data(self, req_id: int, bar: BarData):
-        self.writer.save_bar(req_id, bar)
+        self.current_writer.save_bar(bar)
 
     def cleanup(self, *args):
-        self.writer.finalize()
+        if self.current_writer:
+            self.current_writer.finalize()
 
 class SnapshotWrapper(EWrapper):
 
@@ -172,10 +164,52 @@ class SnapshotWrapper(EWrapper):
 
 
 class SnapshotApp(EClient):
-    def __init__(self, base_symbol : str, exchange : str):
-        self.driver = SnapshotDriver(self,
-                                     base_symbol=base_symbol,
-                                     exchange=exchange)
+    EQUITY_MAPPER = [("H", 3), ("M", 6), ("U", 9), ("Z", 12), ("H", 3)]
+
+    @staticmethod
+    def third_friday(year, month):
+        fridays = [d for d in range(1, 22) if
+                   datetime.datetime(year=year, month=month,
+                                     day=d).weekday() == 4]
+        return datetime.datetime(year=year, month=month, day=fridays[2])
+
+    @staticmethod
+    def get_roll_dates(year : int, mapper=EQUITY_MAPPER):
+        expiration_years = [year] * 4 + [year + 1]
+        roll_dates = OrderedDict([(SnapshotApp.third_friday(y, m[1])
+                                   - datetime.timedelta(days=8),
+                                   m[0])
+                                  for y, m in zip(expiration_years, mapper)])
+        return roll_dates
+
+    @staticmethod
+    def futures_contract(ticker: str, exchange: str):
+        # ! [futcontract_local_symbol]
+        contract = Contract()
+        contract.secType = "FUT"
+        contract.exchange = exchange
+        contract.currency = "USD"
+        contract.localSymbol = ticker
+        # ! [futcontract_local_symbol]
+        return contract
+
+    @staticmethod
+    def compute_ticker(base="ES", exchange="GLOBEX", mapper=EQUITY_MAPPER,
+                       end_date=datetime.datetime.today()):
+        """ third Friday in the third month of each quarter """
+        roll_dates = SnapshotApp.get_roll_dates(end_date.year, mapper=mapper)
+        expiration_label = next(roll_dates[dt] for dt in roll_dates
+                                if dt > end_date)
+        year_suffix = str(end_date.year)[-1:]
+        ticker = f"{base}{expiration_label}{year_suffix}"
+        return SnapshotApp.futures_contract(ticker, exchange)
+
+    def __init__(self):
+        # TODO: Accept a list of symbols and exchanges and a max lookback length
+        end_date = datetime.datetime.today()
+        contract = SnapshotApp.compute_ticker(end_date=end_date)
+        self.requests = [SnapshotDriver.Request(contract, end_date)]
+        self.driver = SnapshotDriver(self, self.requests)
         wrapper = SnapshotWrapper(self.driver)
         EClient.__init__(self, wrapper=wrapper)
 
@@ -186,8 +220,6 @@ def configure_parser(parser):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=7497, type=int)
     parser.add_argument("--clientid", default=0, type=int)
-    parser.add_argument("--symbol", default="ES")
-    parser.add_argument("--exchange", default="GLOBEX")
     return parser
 
 if __name__ == "__main__":
@@ -207,6 +239,6 @@ if __name__ == "__main__":
     else:
         logging.basicConfig(level=logging.WARNING)
 
-    app = SnapshotApp(args.symbol, args.exchange)
+    app = SnapshotApp()
     app.connect(args.host, args.port, args.clientid)
     app.run()
