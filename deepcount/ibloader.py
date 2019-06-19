@@ -201,22 +201,42 @@ class SnapshotApp(EClient):
         return contract
 
     @staticmethod
+    def local_symbol(base: str, expiration_label: str, year: int):
+        year_suffix = str(year)[-1:]
+        ticker = f"{base}{expiration_label}{year_suffix}"
+        return ticker
+
+    @staticmethod
     def compute_ticker(base: str, exchange: str, mapper: list,
                        end_date: datetime.datetime):
         """ third Friday in the third month of each quarter """
         roll_dates = SnapshotApp.get_roll_dates(end_date.year, mapper=mapper)
         expiration_label = next(roll_dates[dt] for dt in roll_dates
                                 if dt > end_date)
-        year_suffix = str(end_date.year)[-1:]
-        ticker = f"{base}{expiration_label}{year_suffix}"
+        ticker = SnapshotApp.local_symbol(base, expiration_label, end_date.year)
         return SnapshotApp.futures_contract(ticker, exchange)
 
-    def __init__(self, base="ES", exchange="GLOBEX"):
-        mapper = self.MAPPERS[base]
+    @staticmethod
+    def compute_requests(base: str, exchange: str,
+                         lookback=datetime.timedelta(days=180)):
         end_date = datetime.datetime.today()
-        contract = SnapshotApp.compute_ticker(base, exchange, mapper,
-                                              end_date=end_date)
-        self.requests = [SnapshotDriver.Request(contract, end_date)]
+        start_date = end_date - lookback
+        mapper = SnapshotApp.MAPPERS[base]
+        roll_dates = SnapshotApp.get_roll_dates(end_date.year, mapper=mapper)
+        roll_dates.update(SnapshotApp.get_roll_dates(end_date.year - 1,
+                                                     mapper=mapper))
+        within_lookback = [d for d in sorted(roll_dates)
+                           if start_date < d < end_date]
+        local_symbols = [SnapshotApp.local_symbol(base, roll_dates[d], d.year)
+                         for d in within_lookback]
+        contracts = [SnapshotApp.futures_contract(ticker, exchange)
+                     for ticker in local_symbols]
+        requests = [SnapshotDriver.Request(contract, d)
+                    for contract, d in zip(contracts, within_lookback)]
+        return requests
+
+    def __init__(self, base="ES", exchange="GLOBEX"):
+        self.requests = SnapshotApp.compute_requests(base, exchange)
         self.driver = SnapshotDriver(self, self.requests)
         wrapper = SnapshotWrapper(self.driver)
         EClient.__init__(self, wrapper=wrapper)
