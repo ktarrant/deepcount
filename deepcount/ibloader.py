@@ -166,6 +166,13 @@ class SnapshotWrapper(EWrapper):
 class SnapshotApp(EClient):
     EQUITY_MAPPER = [("H", 3), ("M", 6), ("U", 9), ("Z", 12), ("H", 3)]
 
+    MAPPERS = {
+        "ES": EQUITY_MAPPER,
+        "NQ": EQUITY_MAPPER,
+        "RTY": EQUITY_MAPPER,
+        "YM": EQUITY_MAPPER,
+    }
+
     @staticmethod
     def third_friday(year, month):
         fridays = [d for d in range(1, 22) if
@@ -194,8 +201,8 @@ class SnapshotApp(EClient):
         return contract
 
     @staticmethod
-    def compute_ticker(base="ES", exchange="GLOBEX", mapper=EQUITY_MAPPER,
-                       end_date=datetime.datetime.today()):
+    def compute_ticker(base: str, exchange: str, mapper: list,
+                       end_date: datetime.datetime):
         """ third Friday in the third month of each quarter """
         roll_dates = SnapshotApp.get_roll_dates(end_date.year, mapper=mapper)
         expiration_label = next(roll_dates[dt] for dt in roll_dates
@@ -204,10 +211,11 @@ class SnapshotApp(EClient):
         ticker = f"{base}{expiration_label}{year_suffix}"
         return SnapshotApp.futures_contract(ticker, exchange)
 
-    def __init__(self):
-        # TODO: Accept a list of symbols and exchanges and a max lookback length
+    def __init__(self, base="ES", exchange="GLOBEX"):
+        mapper = self.MAPPERS[base]
         end_date = datetime.datetime.today()
-        contract = SnapshotApp.compute_ticker(end_date=end_date)
+        contract = SnapshotApp.compute_ticker(base, exchange, mapper,
+                                              end_date=end_date)
         self.requests = [SnapshotDriver.Request(contract, end_date)]
         self.driver = SnapshotDriver(self, self.requests)
         wrapper = SnapshotWrapper(self.driver)
@@ -220,6 +228,8 @@ def configure_parser(parser):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=7497, type=int)
     parser.add_argument("--clientid", default=0, type=int)
+    parser.add_argument("--symbol", default="ES")
+    parser.add_argument("--exchange", default="GLOBEX")
     return parser
 
 if __name__ == "__main__":
@@ -239,6 +249,6 @@ if __name__ == "__main__":
     else:
         logging.basicConfig(level=logging.WARNING)
 
-    app = SnapshotApp()
+    app = SnapshotApp(base=args.symbol, exchange=args.exchange)
     app.connect(args.host, args.port, args.clientid)
     app.run()
