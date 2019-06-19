@@ -124,7 +124,7 @@ class SnapshotDriver():
         return len(self.requests) > 0
 
     def send_req_historical(self, *_, **__):
-        request = self.requests.pop()
+        request = self.requests.pop(0)
         local_symbol = request.contract.localSymbol
         if self.current_writer:
             self.current_writer.finalize()
@@ -166,11 +166,16 @@ class SnapshotWrapper(EWrapper):
 class SnapshotApp(EClient):
     EQUITY_MAPPER = [("H", 3), ("M", 6), ("U", 9), ("Z", 12), ("H", 3)]
 
+    EQUITIES = ["ES", "NQ", "RTY"]
     MAPPERS = {
         "ES": EQUITY_MAPPER,
         "NQ": EQUITY_MAPPER,
         "RTY": EQUITY_MAPPER,
-        "YM": EQUITY_MAPPER,
+    }
+    EXCHANGES = {
+        "ES": "GLOBEX",
+        "NQ": "GLOBEX",
+        "RTY": "GLOBEX",
     }
 
     @staticmethod
@@ -181,13 +186,13 @@ class SnapshotApp(EClient):
         return datetime.datetime(year=year, month=month, day=fridays[2])
 
     @staticmethod
-    def get_roll_dates(year : int, mapper=EQUITY_MAPPER):
+    def get_expiration_dates(year : int, mapper=EQUITY_MAPPER):
         expiration_years = [year] * 4 + [year + 1]
-        roll_dates = OrderedDict([(SnapshotApp.third_friday(y, m[1])
-                                   - datetime.timedelta(days=8),
-                                   m[0])
-                                  for y, m in zip(expiration_years, mapper)])
-        return roll_dates
+        expiration_dates = OrderedDict([
+            (SnapshotApp.third_friday(y, m[1]), m[0])
+            for y, m in zip(expiration_years, mapper)
+        ])
+        return expiration_dates
 
     @staticmethod
     def futures_contract(ticker: str, exchange: str):
@@ -207,36 +212,33 @@ class SnapshotApp(EClient):
         return ticker
 
     @staticmethod
-    def compute_ticker(base: str, exchange: str, mapper: list,
+    def compute_contract(base: str, exchange: str, mapper: list,
                        end_date: datetime.datetime):
         """ third Friday in the third month of each quarter """
-        roll_dates = SnapshotApp.get_roll_dates(end_date.year, mapper=mapper)
-        expiration_label = next(roll_dates[dt] for dt in roll_dates
-                                if dt > end_date)
-        ticker = SnapshotApp.local_symbol(base, expiration_label, end_date.year)
+        expiration_dates = SnapshotApp.get_expiration_dates(end_date.year,
+                                                            mapper=mapper)
+        expiration_date = next(expiration_date
+                               for expiration_date in expiration_dates
+                               if expiration_date > end_date)
+        expiration_label = expiration_dates[expiration_date]
+        ticker = SnapshotApp.local_symbol(base, expiration_label,
+                                          expiration_date.year)
         return SnapshotApp.futures_contract(ticker, exchange)
 
     @staticmethod
-    def compute_requests(base: str, exchange: str,
-                         lookback=datetime.timedelta(days=180)):
+    def compute_requests():
         end_date = datetime.datetime.today()
-        start_date = end_date - lookback
-        mapper = SnapshotApp.MAPPERS[base]
-        roll_dates = SnapshotApp.get_roll_dates(end_date.year, mapper=mapper)
-        roll_dates.update(SnapshotApp.get_roll_dates(end_date.year - 1,
-                                                     mapper=mapper))
-        within_lookback = [d for d in sorted(roll_dates)
-                           if start_date < d < end_date]
-        local_symbols = [SnapshotApp.local_symbol(base, roll_dates[d], d.year)
-                         for d in within_lookback]
-        contracts = [SnapshotApp.futures_contract(ticker, exchange)
-                     for ticker in local_symbols]
-        requests = [SnapshotDriver.Request(contract, d)
-                    for contract, d in zip(contracts, within_lookback)]
+        contracts = [SnapshotApp.compute_contract(base,
+                                                  SnapshotApp.EXCHANGES[base],
+                                                  SnapshotApp.MAPPERS[base],
+                                                  end_date)
+                     for base in SnapshotApp.EQUITIES]
+        requests = [SnapshotDriver.Request(contract, end_date)
+                    for contract in contracts]
         return requests
 
-    def __init__(self, base="ES", exchange="GLOBEX"):
-        self.requests = SnapshotApp.compute_requests(base, exchange)
+    def __init__(self):
+        self.requests = SnapshotApp.compute_requests()
         self.driver = SnapshotDriver(self, self.requests)
         wrapper = SnapshotWrapper(self.driver)
         EClient.__init__(self, wrapper=wrapper)
@@ -248,8 +250,6 @@ def configure_parser(parser):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=7497, type=int)
     parser.add_argument("--clientid", default=0, type=int)
-    parser.add_argument("--symbol", default="ES")
-    parser.add_argument("--exchange", default="GLOBEX")
     return parser
 
 if __name__ == "__main__":
@@ -269,6 +269,6 @@ if __name__ == "__main__":
     else:
         logging.basicConfig(level=logging.WARNING)
 
-    app = SnapshotApp(base=args.symbol, exchange=args.exchange)
+    app = SnapshotApp()
     app.connect(args.host, args.port, args.clientid)
     app.run()
