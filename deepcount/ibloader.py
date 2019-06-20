@@ -212,29 +212,29 @@ class SnapshotApp(EClient):
         return ticker
 
     @staticmethod
-    def compute_contract(base: str, exchange: str, mapper: list,
-                       end_date: datetime.datetime):
+    def compute_contract(base: str):
         """ third Friday in the third month of each quarter """
-        expiration_dates = SnapshotApp.get_expiration_dates(end_date.year,
+        today = datetime.datetime.today()
+        exchange = SnapshotApp.EXCHANGES[base]
+        mapper = SnapshotApp.MAPPERS[base]
+        expiration_dates = SnapshotApp.get_expiration_dates(today.year,
                                                             mapper=mapper)
         expiration_date = next(expiration_date
                                for expiration_date in expiration_dates
-                               if expiration_date > end_date)
+                               if expiration_date > today)
         expiration_label = expiration_dates[expiration_date]
         ticker = SnapshotApp.local_symbol(base, expiration_label,
                                           expiration_date.year)
-        return SnapshotApp.futures_contract(ticker, exchange)
+        contract = SnapshotApp.futures_contract(ticker, exchange)
+        roll_date = expiration_date - datetime.timedelta(days=8)
+        end_date = min(roll_date, today)
+        request = SnapshotDriver.Request(contract, end_date)
+        return request
 
     @staticmethod
     def compute_requests():
-        end_date = datetime.datetime.today()
-        contracts = [SnapshotApp.compute_contract(base,
-                                                  SnapshotApp.EXCHANGES[base],
-                                                  SnapshotApp.MAPPERS[base],
-                                                  end_date)
-                     for base in SnapshotApp.EQUITIES]
-        requests = [SnapshotDriver.Request(contract, end_date)
-                    for contract in contracts]
+        requests = [SnapshotApp.compute_contract(base)
+                    for base in SnapshotApp.EQUITIES]
         return requests
 
     def __init__(self):
