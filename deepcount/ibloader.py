@@ -1,6 +1,7 @@
 import logging
 import datetime
 import os
+from calendar import monthrange
 from collections import OrderedDict
 
 from transitions import Machine
@@ -149,6 +150,7 @@ class SnapshotDriver():
         if self.current_writer:
             self.current_writer.finalize()
 
+
 class SnapshotWrapper(EWrapper):
 
     def __init__(self, driver : SnapshotDriver):
@@ -162,30 +164,7 @@ class SnapshotWrapper(EWrapper):
         except AttributeError:
             return super(SnapshotWrapper, self).__getattribute__(item)
 
-
-class EquityBasket:
-    EXPIRATION_MONTHS = [3, 6, 9, 12]
-    SYMBOLS = ["ES", "NQ", "RTY"]
-    EXCHANGE = "GLOBEX"
-
-    @staticmethod
-    def third_friday(year, month):
-        fridays = [d for d in range(1, 22) if
-                   datetime.datetime(year=year, month=month,
-                                     day=d).weekday() == 4]
-        return datetime.datetime(year=year, month=month, day=fridays[2])
-
-    @staticmethod
-    def get_expiration_dates(symbol: str, year: int):
-        if symbol in EquityBasket.SYMBOLS:
-            expiration_months = (EquityBasket.EXPIRATION_MONTHS
-                                 + [EquityBasket.EXPIRATION_MONTHS[0]])
-            expiration_years = [year] * 4 + [year + 1]
-            return [EquityBasket.third_friday(y, m)
-                    for y, m in zip(expiration_years, expiration_months)]
-
-
-class SnapshotApp(EClient):
+class FuturesBasket:
     EXPIRATION_LABELS = {
         1: "F",
         2: "G",
@@ -213,30 +192,90 @@ class SnapshotApp(EClient):
         return contract
 
     @staticmethod
-    def local_symbol(base: str, expiration_date : datetime.datetime):
-        expiration_label = SnapshotApp.EXPIRATION_LABELS[expiration_date.month]
+    def local_symbol(base: str, expiration_date: datetime.datetime):
+        expiration_label = FuturesBasket.EXPIRATION_LABELS[
+            expiration_date.month]
         year_suffix = str(expiration_date.year)[-1:]
         ticker = f"{base}{expiration_label}{year_suffix}"
         return ticker
 
-    @staticmethod
-    def generate_requests(basket = EquityBasket):
-        """ third Friday in the third month of each quarter """
+    @property
+    def symbols(self):
+        return ["ES", "NQ", "RTY"]
+
+    @property
+    def exchange(self):
+        return "GLOBEX"
+
+    @property
+    def roll_offset(self):
+        return 8
+
+    def get_expiration_date(self, year, month):
+        """ third Friday in the month """
+        fridays = [d for d in range(1, 22) if
+                   datetime.datetime(year=year, month=month,
+                                     day=d).weekday() == 4]
+        return datetime.datetime(year=year, month=month, day=fridays[2])
+
+    def get_expiration_months(self, symbol: str):
+        return [3, 6, 9, 12]
+
+    def get_expiration_dates(self, symbol: str, year: int):
+        expiration_months = self.get_expiration_months(symbol)
+        expiration_months = expiration_months + [expiration_months[0]]
+        expiration_years = [year] * 4 + [year + 1]
+        return [self.get_expiration_date(y, m)
+                for y, m in zip(expiration_years, expiration_months)]
+
+    def generate_requests(self):
         today = datetime.datetime.today()
-        exchange = basket.EXCHANGE
-        for base in basket.SYMBOLS:
-            expiration_dates = basket.get_expiration_dates(base, today.year)
+        for base in self.symbols:
+            expiration_dates = self.get_expiration_dates(base, today.year)
             expiration_date = next(expiration_date
                                    for expiration_date in expiration_dates
-                                   if expiration_date > today)
-            roll_date = expiration_date - datetime.timedelta(days=8)
-            ticker = SnapshotApp.local_symbol(base, expiration_date)
-            contract = SnapshotApp.futures_contract(ticker, exchange)
+                                   if expiration_date >= today)
+            roll_date = (expiration_date
+                         - datetime.timedelta(days=self.roll_offset))
+            ticker = FuturesBasket.local_symbol(base, expiration_date)
+            contract = FuturesBasket.futures_contract(ticker, self.exchange)
             end_date = min(roll_date, today)
             yield SnapshotDriver.Request(contract, end_date)
 
-    def __init__(self):
-        self.requests = list(SnapshotApp.generate_requests())
+class MetalsBasket(FuturesBasket):
+    @property
+    def symbols(self):
+        return ["GC", "HG", "SI"]
+
+    @property
+    def exchange(self):
+        return "NYMEX"
+
+    @property
+    def roll_offset(self):
+        return 7
+
+    def get_expiration_date(self, year, month):
+        _, last_day = monthrange(year, month)
+        bizdays = [d for d in range(last_day, 21, -1)
+                   if (1 <= datetime.datetime(year=year,
+                                              month=month,
+                                              day=d).weekday()
+                       <= 5)]
+        return datetime.datetime(year=year, month=month, day=bizdays[-3])
+
+    def get_expiration_months(self, symbol: str):
+        if symbol is "GC":
+            return [2, 4, 6, 8, 10, 12]
+        elif symbol in ["HG", "SI"]:
+            return [3, 5, 7, 9, 12]
+        else:
+            raise NotImplementedError()
+
+
+class SnapshotApp(EClient):
+    def __init__(self, basket: FuturesBasket):
+        self.requests = list(basket.generate_requests())
         self.driver = SnapshotDriver(self, self.requests)
         wrapper = SnapshotWrapper(self.driver)
         EClient.__init__(self, wrapper=wrapper)
@@ -244,21 +283,25 @@ class SnapshotApp(EClient):
     def keyboardInterrupt(self):
         self.driver.stop()
 
-def configure_parser(parser):
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", default=7497, type=int)
-    parser.add_argument("--clientid", default=0, type=int)
-    return parser
 
 if __name__ == "__main__":
     import argparse
+
+    BASKET_CHOICES = OrderedDict([
+        ("equities", FuturesBasket),
+        ("metals", MetalsBasket),
+    ])
+
     parser = argparse.ArgumentParser(description="""
-    Gets an Option Chain snapshot
+    Collecting futures historical data
     """)
 
     parser.add_argument("-v", "--verbose", action="store_true")
-
-    configure_parser(parser)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", default=7497, type=int)
+    parser.add_argument("--clientid", default=0, type=int)
+    baskets = list(BASKET_CHOICES.keys(),)
+    parser.add_argument("--basket", default=baskets[0], choices=baskets)
 
     args = parser.parse_args()
 
@@ -267,6 +310,7 @@ if __name__ == "__main__":
     else:
         logging.basicConfig(level=logging.WARNING)
 
-    app = SnapshotApp()
+    basket = BASKET_CHOICES[args.basket]()
+    app = SnapshotApp(basket)
     app.connect(args.host, args.port, args.clientid)
     app.run()
