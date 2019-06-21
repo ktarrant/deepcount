@@ -183,7 +183,7 @@ class EquityBasket:
 
 class EquityBasket:
     EXPIRATION_MONTHS = [3, 6, 9, 12]
-    SYMBOLS = ["ES"] # , "NQ", "RTY"]
+    SYMBOLS = ["ES", "NQ", "RTY"]
     EXCHANGE = "GLOBEX"
 
     @staticmethod
