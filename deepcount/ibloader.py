@@ -163,20 +163,8 @@ class SnapshotWrapper(EWrapper):
             return super(SnapshotWrapper, self).__getattribute__(item)
 
 
-class SnapshotApp(EClient):
-    EQUITY_MAPPER = [("H", 3), ("M", 6), ("U", 9), ("Z", 12), ("H", 3)]
-
-    EQUITIES = ["ES", "NQ", "RTY"]
-    MAPPERS = {
-        "ES": EQUITY_MAPPER,
-        "NQ": EQUITY_MAPPER,
-        "RTY": EQUITY_MAPPER,
-    }
-    EXCHANGES = {
-        "ES": "GLOBEX",
-        "NQ": "GLOBEX",
-        "RTY": "GLOBEX",
-    }
+class EquityBasket:
+    EXPIRATION_MONTHS = [3, 6, 9, 12]
 
     @staticmethod
     def third_friday(year, month):
@@ -186,13 +174,50 @@ class SnapshotApp(EClient):
         return datetime.datetime(year=year, month=month, day=fridays[2])
 
     @staticmethod
-    def get_expiration_dates(year : int, mapper=EQUITY_MAPPER):
+    def get_expiration_dates(symbol: str, year: int):
+        expiration_months = (EquityBasket.EXPIRATION_MONTHS
+                             + [EquityBasket.EXPIRATION_MONTHS[0]])
         expiration_years = [year] * 4 + [year + 1]
-        expiration_dates = OrderedDict([
-            (SnapshotApp.third_friday(y, m[1]), m[0])
-            for y, m in zip(expiration_years, mapper)
-        ])
-        return expiration_dates
+        return [EquityBasket.third_friday(y, m)
+                for y, m in zip(expiration_years, expiration_months)]
+
+class EquityBasket:
+    EXPIRATION_MONTHS = [3, 6, 9, 12]
+    SYMBOLS = ["ES"] # , "NQ", "RTY"]
+    EXCHANGE = "GLOBEX"
+
+    @staticmethod
+    def third_friday(year, month):
+        fridays = [d for d in range(1, 22) if
+                   datetime.datetime(year=year, month=month,
+                                     day=d).weekday() == 4]
+        return datetime.datetime(year=year, month=month, day=fridays[2])
+
+    @staticmethod
+    def get_expiration_dates(symbol: str, year: int):
+        if symbol in EquityBasket.SYMBOLS:
+            expiration_months = (EquityBasket.EXPIRATION_MONTHS
+                                 + [EquityBasket.EXPIRATION_MONTHS[0]])
+            expiration_years = [year] * 4 + [year + 1]
+            return [EquityBasket.third_friday(y, m)
+                    for y, m in zip(expiration_years, expiration_months)]
+
+
+class SnapshotApp(EClient):
+    EXPIRATION_LABELS = {
+        1: "F",
+        2: "G",
+        3: "H",
+        4: "J",
+        5: "K",
+        6: "M",
+        7: "N",
+        8: "Q",
+        9: "U",
+        10: "V",
+        11: "X",
+        12: "Z",
+    }
 
     @staticmethod
     def futures_contract(ticker: str, exchange: str):
@@ -206,39 +231,30 @@ class SnapshotApp(EClient):
         return contract
 
     @staticmethod
-    def local_symbol(base: str, expiration_label: str, year: int):
-        year_suffix = str(year)[-1:]
+    def local_symbol(base: str, expiration_date : datetime.datetime):
+        expiration_label = SnapshotApp.EXPIRATION_LABELS[expiration_date.month]
+        year_suffix = str(expiration_date.year)[-1:]
         ticker = f"{base}{expiration_label}{year_suffix}"
         return ticker
 
     @staticmethod
-    def compute_contract(base: str):
+    def generate_requests(basket = EquityBasket):
         """ third Friday in the third month of each quarter """
         today = datetime.datetime.today()
-        exchange = SnapshotApp.EXCHANGES[base]
-        mapper = SnapshotApp.MAPPERS[base]
-        expiration_dates = SnapshotApp.get_expiration_dates(today.year,
-                                                            mapper=mapper)
-        expiration_date = next(expiration_date
-                               for expiration_date in expiration_dates
-                               if expiration_date > today)
-        expiration_label = expiration_dates[expiration_date]
-        ticker = SnapshotApp.local_symbol(base, expiration_label,
-                                          expiration_date.year)
-        contract = SnapshotApp.futures_contract(ticker, exchange)
-        roll_date = expiration_date - datetime.timedelta(days=8)
-        end_date = min(roll_date, today)
-        request = SnapshotDriver.Request(contract, end_date)
-        return request
-
-    @staticmethod
-    def compute_requests():
-        requests = [SnapshotApp.compute_contract(base)
-                    for base in SnapshotApp.EQUITIES]
-        return requests
+        exchange = basket.EXCHANGE
+        for base in basket.SYMBOLS:
+            expiration_dates = basket.get_expiration_dates(base, today.year)
+            expiration_date = next(expiration_date
+                                   for expiration_date in expiration_dates
+                                   if expiration_date > today)
+            roll_date = expiration_date - datetime.timedelta(days=8)
+            ticker = SnapshotApp.local_symbol(base, expiration_date)
+            contract = SnapshotApp.futures_contract(ticker, exchange)
+            end_date = min(roll_date, today)
+            yield SnapshotDriver.Request(contract, end_date)
 
     def __init__(self):
-        self.requests = SnapshotApp.compute_requests()
+        self.requests = list(SnapshotApp.generate_requests())
         self.driver = SnapshotDriver(self, self.requests)
         wrapper = SnapshotWrapper(self.driver)
         EClient.__init__(self, wrapper=wrapper)
