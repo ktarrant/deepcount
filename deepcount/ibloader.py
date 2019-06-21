@@ -165,24 +165,6 @@ class SnapshotWrapper(EWrapper):
 
 class EquityBasket:
     EXPIRATION_MONTHS = [3, 6, 9, 12]
-
-    @staticmethod
-    def third_friday(year, month):
-        fridays = [d for d in range(1, 22) if
-                   datetime.datetime(year=year, month=month,
-                                     day=d).weekday() == 4]
-        return datetime.datetime(year=year, month=month, day=fridays[2])
-
-    @staticmethod
-    def get_expiration_dates(symbol: str, year: int):
-        expiration_months = (EquityBasket.EXPIRATION_MONTHS
-                             + [EquityBasket.EXPIRATION_MONTHS[0]])
-        expiration_years = [year] * 4 + [year + 1]
-        return [EquityBasket.third_friday(y, m)
-                for y, m in zip(expiration_years, expiration_months)]
-
-class EquityBasket:
-    EXPIRATION_MONTHS = [3, 6, 9, 12]
     SYMBOLS = ["ES", "NQ", "RTY"]
     EXCHANGE = "GLOBEX"
 
